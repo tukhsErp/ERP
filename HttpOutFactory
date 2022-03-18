@@ -1,0 +1,563 @@
+
+import com.capeclear.assembly.annotation.Component;
+import com.capeclear.assembly.annotation.ComponentMethod;
+import com.capeclear.logger.LogControl;
+import com.capeclear.logger.Logger;
+import com.capeclear.mediation.MediationContext;
+import com.ukhs.erp.workday.bean.parse.SimpleJSONParser;
+
+import static com.capeclear.assembly.annotation.Component.Type.*;
+
+import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.nio.charset.Charset;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.exception.ExceptionUtils;
+
+/**************************************************************************************
+ * @Author: Dustin Harding                                                            *
+ * @Created: 05/04/2020                                                               *
+ * @Purpose: Facilitate http communications that workday studio cannot handle         *
+ * @Version:                                                                          *
+ * ************************************************************************************
+ * Date       | Author              | Note                                            *
+ * ************************************************************************************
+ * 05/04/2020 | Dustin Harding      | Initial Creation                                *
+ *                                                                                    *
+ * ************************************************************************************
+ */
+@Component(
+        name = "HttpOutFactory",
+        type = outtransport,
+        toolTip = "HttpOutFactory",
+        scope = "prototype",
+        smallIconPath = "icons/HttpOutFactory_16.png",
+        largeIconPath = "icons/HttpOutFactory_24.png"
+)
+public class HttpOutFactory {
+	
+	private enum OutputType {		
+		PROPERTY() {
+			@Override
+			public void pushOutput(MediationContext context, String output) throws Exception {
+				context.setProperty(RESPONSE_CONTEXTVARKEY, output);
+				
+			}
+			
+			@Override
+			public String getOutput(MediationContext context, String key) throws Exception {
+				return context.getProperty(key).toString();
+			}
+		},
+		VARIABLE() {
+			@Override
+			public void pushOutput(MediationContext context, String output) throws Exception {
+				context.getVariables().setVariable(RESPONSE_CONTEXTVARKEY, output, "application/json");
+				
+			}
+			
+			@Override
+			public String getOutput(MediationContext context, String key) throws Exception {
+				return context.getVariables().get(key).getText();
+			}
+		};
+		
+		public abstract void pushOutput(MediationContext context, String output) throws Exception;
+		public abstract String getOutput(MediationContext context, String key) throws Exception;
+		
+	}
+	
+	private enum Method {
+		POST(),
+		GET(),
+		DELETE();
+	}
+	
+	private static final Logger logger = LogControl.getLogger( HttpOutFactory.class );
+	private static final int MAXIMUM_RECURSIVE_CALLS = 50000;
+	private static final String LINE_FEED = "\n";
+	private static final String RAWPAYLOAD_KEY = "PAYLOAD";
+	private static final String DEFAULT_CHARSET = "UTF-8";
+	private static final String DEFAULT_BOUNDARY = "UKHSCALL"+System.currentTimeMillis();
+	private static final String DEFAULT_HEADERSPEARATOR = "&";
+	private static final String DEFAULT_BODYSEPARATOR = "&";
+	private static final String DEFAULT_KEYVALUESEPARATOR = "=";
+	private static final String DEFAULT_OUTPUTTYPE = "PROPERTY";	
+	private static final String CHARSET_CONTEXTVARKEY = "HttpOutFactory_CHARSET";
+	private static final String ENDPOINT_CONTEXTVARKEY = "HttpOutFactory_ENDPOINT";
+	private static final String HEADER_SEPARATOR_CONTEXTVARKEY = "HttpOutFactory_HEADER_SEPARATOR";
+	private static final String HEADER_CONTEXTVARKEY = "HttpOutFactory_HEADER";
+	private static final String BODY_SEPARATOR_CONTEXTVARKEY = "HttpOutFactory_BODY_SEPARATOR";
+	private static final String BODY_CONTEXTVARKEY =  "HttpOutFactory_BODY";
+	private static final String BODY_RAWPAYLOAD_CONTEXTVARKEY =  "HttpOutFactory_BODY_RAWPAYLOAD";
+	private static final String OUTPUTTYPE_CONTEXTVARKEY =  "HttpOutFactory_OUTPUTTYPE";
+	private static final String LOGGING_CONTEXTVARKEY = "HttpOutFactory_LOGGING";
+	private static final String RECURSION_CONTEXTVARKEY = "HttpOutFactory_RECURSION";
+	private static final String RECURSION_INDICATOR_CONTEXTVARKEY = "HttpOutFactory_RECURSION_INDICATOR";
+	private static final String RECURSION_INDICATOR_TYPE_CONTEXTVARKEY = "HttpOutFactory_RECURSION_INDICATOR_TYPE";
+	private static final String RECURSION_INDICATOR_COMPARISON_CONTEXTVARKEY = "HttpOutFactory_RECURSION_INDICATOR_COMPARISON";
+	private static final String RECURSION_INCREMENT_KEY_CONTEXTVARKEY = "HttpOutFactory_RECURSION_INCREMENT_KEY";
+	private static final String RECURSION_FRAGMENT_CONTEXTVARKEY = "HttpOutFactory_RECURSION_FRAGMENT";
+	private static final String RECURSION_FRAGMENT_TYPE_CONTEXTVARKEY = "HttpOutFactory_RECURSION_FRAGMENT_TYPE";
+	private static final String RECURSION_FRAGMENT_BUFFER_CONTEXTVARKEY = "HttpOutFactory_RECURSION_FRAGMENT_BUFFER";
+	private static final String RECURSION_FRAGMENT_HEADER_CONTEXTVARKEY = "HttpOutFactory_RECURSION_FRAGMENT_HEADER";
+	private static final String RECURSION_FRAGMENT_FOOTER_CONTEXTVARKEY = "HttpOutFactory_RECURSION_FRAGMENT_FOOTER";
+	private static final String RECURSION_DELETION_ARRAY_CONTEXTVARKEY = "HttpOutFactory_DELETION_ARRAY";
+	private static final String RECURSION_DELETION_ARRAY_OBJECT_KEY_CONTEXTVARKEY = "HttpOutFactory_DELETION_ARRAY_OBJECT_KEY";
+	private static final String RECURSION_DELETION_ARRAY_FIELD_KEY_CONTEXTVARKEY = "HttpOutFactory_DELETION_ARRAY_FIELD_KEY";
+	private static final String RESPONSE_CONTEXTVARKEY = "HttpOutFactory_RESPONSE";
+	private boolean rawPayload = false;
+	private boolean loggingIsOn = false;
+	private boolean recursion = false;
+	private String recursionIndicator;
+	private String recursionIndicatorType;
+	private String recursionIndicatorComparison;
+	private String recursionIncrementKey;
+	private String recursionFragment;
+	private String recursionFragmentType;
+	private String recursionFragmentHeader;
+	private String recursionFragmentFooter;
+	private int recursionFragmentBuffer;
+	private String charset;
+	private String endpoint;
+	private String headerSeparator;
+	private String bodySeparator;
+	private String outputType;
+	private String rawResponse;
+	private String response;
+	private String deletionArray;
+	private String deletionArrayField;
+	private String deletionArrayObject;
+	private HashMap<String,String> header;
+	private HashMap<String,String> body;
+	private MediationContext context;
+	private URL url;
+	private HttpURLConnection httpConn = null;
+	private PrintWriter writer = null;
+
+	/**
+     * Execution method
+     */
+    @ComponentMethod
+    public void delete(MediationContext arg0) throws Exception {
+    	context = arg0;
+    	pullContextProperties();
+    	
+    	if(recursion) {
+    		executeRecursiveDelete();
+    	} else {
+    		executeDelete();
+    	}
+    	captureResponse(response);   
+    }
+	
+	/**
+     * Helper object to organize the recursive DELETE process
+     */
+    private void executeRecursiveDelete() throws Exception {
+
+    	try {
+    		
+        	String baseUrl = endpoint;
+        	LinkedHashMap<String,LinkedHashMap<String,String>> calls  = SimpleJSONParser.getJsonIterableArrayByPath(deletionArray, deletionArrayObject, deletionArrayField);
+    		ArrayList<String> recursiveResponse = new ArrayList<String>();
+        	
+        	for(Map.Entry<String,LinkedHashMap<String,String>> map : calls.entrySet() ) {
+    		
+        		endpoint = baseUrl;
+        		addPathToEndpoint(map.getKey());
+    			executeDelete();
+				recursiveResponse.add(response);
+				
+				log("found next result, the  id is: "+map.getKey()+", the url will be: "+endpoint+", and the body will be: "+body.values().toArray()[0].toString(), false);
+				log("response from delete call was: "+ response, false);
+        	}
+        		
+        	response = String.join(",", recursiveResponse);
+        	
+    	} catch(Exception e) {
+	        log("Encountered a problem while executing a recursive DELETE, Exception: "+ExceptionUtils.getStackTrace(e), true);
+    		closeConnection(true);
+    	    throw e;
+    	}
+    }
+	
+	/**
+     * Helper object to organize the DELETE process
+     */
+    private void executeDelete() throws Exception {
+ 
+    	try {
+        	openConnection(Method.DELETE);
+        	transmitContent();
+        	response = IOUtils.toString(httpConn.getInputStream(), Charset.forName("UTF-8"));
+        	closeConnection(false);
+        	
+    	} catch(Exception e) {
+	        log("Encountered a problem while executing a DELTE, Exception: "+ExceptionUtils.getStackTrace(e), true);
+    		closeConnection(true);
+    	    throw e;
+    	}
+    }
+	
+    /**
+     * Execution method
+     */
+    @ComponentMethod
+    public void get(MediationContext arg0) throws Exception {
+    	context = arg0;
+    	pullContextProperties();
+    	
+    	if(recursion) {
+    		executeRecursiveGet();
+    	} else {
+    		executeGet();
+    	}
+    	captureResponse(response);   
+    }
+	
+	/**
+     * Helper object to organize the recursive GET process
+     */
+    private void executeRecursiveGet() throws Exception {
+ 
+    	try {
+    		
+    		int count = 0;
+    		String recursionStatus = "";
+        	String baseUrl = endpoint;
+        	ArrayList<String> recursiveResponse = new ArrayList<String>();
+        	
+        	do {
+    			count++;        			
+    			endpoint = baseUrl;
+    			addQueryStringToEndpoint(recursionIncrementKey, count+"");
+    			executeGet();
+				recursionStatus = SimpleJSONParser.getJsonObjectByPath(rawResponse, recursionIndicator, recursionIndicatorType);
+				recursiveResponse.add(response);
+    			
+        	} while(recursionStatus.equalsIgnoreCase(recursionIndicatorComparison) && count < MAXIMUM_RECURSIVE_CALLS);
+        		
+        	response = String.join(",", recursiveResponse);
+        	
+    	} catch(Exception e) {
+	        log("Encountered a problem while executing a recursive GET, Exception: "+ExceptionUtils.getStackTrace(e), true);
+    		closeConnection(true);
+    	    throw e;
+    	}
+    }
+	
+	/**
+     * Helper object to organize the GET process
+     */
+    private void executeGet() throws Exception {
+ 
+    	try {
+        	openConnection(Method.GET);
+        	rawResponse = IOUtils.toString(httpConn.getInputStream(), Charset.forName("UTF-8"));
+        	if(recursionFragment != null) {
+        		response = SimpleJSONParser.getJsonObjectByPath(rawResponse, recursionFragment, recursionFragmentType);
+        	} else {
+        		response = rawResponse;
+        	}
+        	closeConnection(false);
+        	
+    	} catch(Exception e) {
+	        log("Encountered a problem while executing a GET, Exception: "+ExceptionUtils.getStackTrace(e), true);
+    		closeConnection(true);
+    	    throw e;
+    	}
+    }
+    
+    /**
+     * Execution Method
+     * @param arg0
+     * @throws Exception
+     */
+    @ComponentMethod
+    public void post(MediationContext arg0) throws Exception {
+    	context = arg0;
+    	pullContextProperties();
+    	
+    	if(recursion) {
+    		executeRecursivePost();
+    	} else {
+    		executePost();
+    	}
+    	captureResponse(response);  
+    }
+    
+    /**
+     * Helper object to organize the recursive POST process
+     * @throws Exception
+     */
+    private void executeRecursivePost() throws Exception {
+    	
+    	if(!rawPayload) {
+    		throw new Exception("recursive posts are only supported on rawpayload operations where the payload is JSON");
+    	}
+    	
+    	try {
+    		
+    		int counter = 0;
+    		LinkedHashMap<String,LinkedHashMap<String,String>> calls  = SimpleJSONParser.getJsonIterableArrayByPath(body.values().toArray()[0].toString(), recursionFragment);
+        	ArrayList<String> recursivetransmissions = new ArrayList<String>();
+    		ArrayList<String> recursiveResponse = new ArrayList<String>();
+        	
+        	for(Map.Entry<String,LinkedHashMap<String,String>> map : calls.entrySet() ) {
+        		
+        		counter++;
+        		recursivetransmissions.add(map.getValue().get(SimpleJSONParser.RAWOBJECT_REFERENCE));
+        		
+        		if(counter % recursionFragmentBuffer == 0 || counter == calls.size() ) {
+        			log("Calls size="+calls.size()+", counter="+counter+", recursionFragmentBuffer="+recursionFragmentBuffer+", calculation="+(counter % recursionFragmentBuffer), false);
+        			body = new HashMap<String,String>();
+            		
+        			if(!recursionFragmentHeader.isEmpty() && !recursionFragmentFooter.isEmpty()) {
+        				body.put(RAWPAYLOAD_KEY, (recursionFragmentHeader+String.join(",", recursivetransmissions)+recursionFragmentFooter));
+        			} else {
+        				body.put(RAWPAYLOAD_KEY, ("{\""+recursionFragment+"\":["+String.join(",", recursivetransmissions)+"]}"));
+        			}
+        			
+            		executePost();
+    				recursiveResponse.add(response);
+    				recursivetransmissions = new ArrayList<String>();
+    				
+    				log("found next group of results, the count is: "+counter+", the output will be: "+body.values().toArray()[0].toString(), false);
+    				log("response from post call was: "+ response, false);
+    				
+    				if((counter/recursionFragmentBuffer) >= MAXIMUM_RECURSIVE_CALLS) {
+            			break;
+            		}
+        		}
+        	}
+        		
+        	response = String.join(",", recursiveResponse);
+        	
+    	} catch(Exception e) {
+	        log("Encountered a problem while executing a recursive POST, Exception: "+ExceptionUtils.getStackTrace(e), true);
+    		closeConnection(true);
+    	    throw e;
+    	}
+    }
+    
+    /**
+     * Helper object to organize the POST process
+     */
+    private void executePost() throws Exception {
+ 
+    	try {
+        	openConnection(Method.POST);
+        	transmitContent();
+        	response = IOUtils.toString(httpConn.getInputStream(), Charset.forName("UTF-8"));
+        	closeConnection(false);
+        	
+    	} catch(Exception e) {
+	        log("Encountered a problem while executing a POST, Exception: "+ExceptionUtils.getStackTrace(e), true);
+    		closeConnection(true);
+    	    throw e;
+    	}
+    }
+	
+	/**
+	 * Pop phase hook
+	 */
+	@ComponentMethod
+	public void response(MediationContext context) throws Exception {
+        //do nothing 
+    }
+	
+	/**
+	 * Helper object to pull all required properties
+	 */
+	private void pullContextProperties() throws Exception { 		
+		try {
+			outputType = context.getProperty(OUTPUTTYPE_CONTEXTVARKEY)!=null?((String)context.getProperty(OUTPUTTYPE_CONTEXTVARKEY)):DEFAULT_OUTPUTTYPE;
+			charset = context.getProperty(CHARSET_CONTEXTVARKEY)!=null?((String)context.getProperty(CHARSET_CONTEXTVARKEY)):DEFAULT_CHARSET;
+			endpoint = ((String)context.getProperty(ENDPOINT_CONTEXTVARKEY));
+			headerSeparator = context.getProperty(HEADER_SEPARATOR_CONTEXTVARKEY)!=null?((String)context.getProperty(HEADER_SEPARATOR_CONTEXTVARKEY)):DEFAULT_HEADERSPEARATOR;
+			bodySeparator = context.getProperty(BODY_SEPARATOR_CONTEXTVARKEY)!=null?((String)context.getProperty(BODY_SEPARATOR_CONTEXTVARKEY)):DEFAULT_BODYSEPARATOR;
+			header = new HashMap<String,String>();
+			body = new HashMap<String,String>();
+			rawPayload = ((context.getProperty(BODY_RAWPAYLOAD_CONTEXTVARKEY) != null && (((String)context.getProperty(BODY_RAWPAYLOAD_CONTEXTVARKEY)).equalsIgnoreCase("Y") || ((String)context.getProperty(BODY_RAWPAYLOAD_CONTEXTVARKEY)).equalsIgnoreCase("TRUE"))));
+			loggingIsOn = ((context.getProperty(LOGGING_CONTEXTVARKEY) != null && ((String)context.getProperty(LOGGING_CONTEXTVARKEY)).equals("1")));
+			recursion = ((context.getProperty(RECURSION_CONTEXTVARKEY) != null && (((String)context.getProperty(RECURSION_CONTEXTVARKEY)).equalsIgnoreCase("Y") || ((String)context.getProperty(RECURSION_CONTEXTVARKEY)).equalsIgnoreCase("TRUE"))));
+			recursionIndicator = ((String)context.getProperty(RECURSION_INDICATOR_CONTEXTVARKEY))!=null?((String)context.getProperty(RECURSION_INDICATOR_CONTEXTVARKEY)):"";
+			recursionIndicatorComparison = ((String)context.getProperty(RECURSION_INDICATOR_COMPARISON_CONTEXTVARKEY))!=null?((String)context.getProperty(RECURSION_INDICATOR_COMPARISON_CONTEXTVARKEY)):"";
+			recursionIndicatorType = ((String)context.getProperty(RECURSION_INDICATOR_TYPE_CONTEXTVARKEY))!=null?((String)context.getProperty(RECURSION_INDICATOR_TYPE_CONTEXTVARKEY)):"";
+			recursionIncrementKey = ((String)context.getProperty(RECURSION_INCREMENT_KEY_CONTEXTVARKEY))!=null?((String)context.getProperty(RECURSION_INCREMENT_KEY_CONTEXTVARKEY)):"";
+			recursionFragment = ((String)context.getProperty(RECURSION_FRAGMENT_CONTEXTVARKEY))!=null?((String)context.getProperty(RECURSION_FRAGMENT_CONTEXTVARKEY)):"";
+			recursionFragmentHeader = ((String)context.getProperty(RECURSION_FRAGMENT_HEADER_CONTEXTVARKEY))!=null?((String)context.getProperty(RECURSION_FRAGMENT_HEADER_CONTEXTVARKEY)):"";
+			recursionFragmentFooter = ((String)context.getProperty(RECURSION_FRAGMENT_FOOTER_CONTEXTVARKEY))!=null?((String)context.getProperty(RECURSION_FRAGMENT_FOOTER_CONTEXTVARKEY)):"";
+			recursionFragmentType = ((String)context.getProperty(RECURSION_FRAGMENT_TYPE_CONTEXTVARKEY))!=null?((String)context.getProperty(RECURSION_FRAGMENT_TYPE_CONTEXTVARKEY)):"";
+			recursionFragmentBuffer = Integer.parseInt(((String)context.getProperty(RECURSION_FRAGMENT_BUFFER_CONTEXTVARKEY))!=null?((String)context.getProperty(RECURSION_FRAGMENT_BUFFER_CONTEXTVARKEY)):"0");
+			deletionArray = ((String)context.getProperty(RECURSION_DELETION_ARRAY_CONTEXTVARKEY))!=null?((String)context.getProperty(RECURSION_DELETION_ARRAY_CONTEXTVARKEY)):"";
+			deletionArrayField = ((String)context.getProperty(RECURSION_DELETION_ARRAY_FIELD_KEY_CONTEXTVARKEY))!=null?((String)context.getProperty(RECURSION_DELETION_ARRAY_FIELD_KEY_CONTEXTVARKEY)):"";
+			deletionArrayObject = ((String)context.getProperty(RECURSION_DELETION_ARRAY_OBJECT_KEY_CONTEXTVARKEY))!=null?((String)context.getProperty(RECURSION_DELETION_ARRAY_OBJECT_KEY_CONTEXTVARKEY)):"";
+								
+			if(((String)context.getProperty(HEADER_CONTEXTVARKEY)) != null) {
+				for(String mapEntry : ((String)context.getProperty(HEADER_CONTEXTVARKEY)).split(headerSeparator)) {
+					header.put(mapEntry.split(DEFAULT_KEYVALUESEPARATOR)[0], mapEntry.split(DEFAULT_KEYVALUESEPARATOR)[1]);
+				}
+			}
+			
+			if(((String)context.getProperty(BODY_CONTEXTVARKEY)) != null && !((String)context.getProperty(BODY_CONTEXTVARKEY)).isEmpty()) {				
+				if(rawPayload) {
+					body.put(RAWPAYLOAD_KEY, ((String)context.getProperty(BODY_CONTEXTVARKEY)));
+				} else {
+					for(String mapEntry : ((String)context.getProperty(BODY_CONTEXTVARKEY)).split(bodySeparator)) {
+						body.put(mapEntry.split(DEFAULT_KEYVALUESEPARATOR)[0], mapEntry.split(DEFAULT_KEYVALUESEPARATOR)[1]);
+					}
+				}
+			}
+			
+			log("Using the following properties"
+					+ "\r\nouputtype="+outputType
+					+ "\r\ncharset="+charset
+					+ "\r\nendpoint="+endpoint
+					+ "\r\nheaderSeparator="+headerSeparator
+					+ "\r\nbodySeparator="+bodySeparator
+					+ "\r\nheader="+header.toString()
+					+ "\r\nrawPayload="+rawPayload
+					+ "\r\nloggingIsOn="+loggingIsOn
+					+ "\r\nrecursionIndicator="+recursionIndicator
+					+ "\r\nrecursionIndicatorComparison="+recursionIndicatorComparison
+					+ "\r\nresponseFragment="+recursionFragment
+					+ "\r\nbody="+body.toString(), false);
+		} catch(Exception e) {
+			log("Unable to pull properties, are you missing a required property?", true);
+			throw e;
+		}
+	}
+	
+	/**
+	 * Helper object to manage the opening of the http connection
+	 * @throws Exception
+	 */
+	private void openConnection(Method protocol) throws Exception {
+		log("opening Connection", false);
+		
+		url = new URL(endpoint);
+    	httpConn = (HttpURLConnection) url.openConnection();
+    	httpConn.setUseCaches(false);
+    	httpConn.setRequestMethod(protocol.name());
+
+		for (Map.Entry<String,String> entry : header.entrySet()) {  	            
+			httpConn.setRequestProperty(entry.getKey(), entry.getValue());
+    	}
+		
+    	if(protocol.name() != Method.GET.name()) {
+    		httpConn.setDoOutput(true);
+    		writer = new PrintWriter(new OutputStreamWriter(httpConn.getOutputStream(), charset), true);
+    	}   	
+	}
+
+	/**
+	 * Helper object to manage the closing of the http connection
+	 */
+	private void closeConnection(boolean somethingWentWrong) {
+		try {	    	
+	    	if(writer != null) {
+	    		writer.close();
+	    	}
+	    } catch (Exception e) {
+	        e.printStackTrace();
+	        log("Encountered a problem while closing the http writer, Exception: "+ExceptionUtils.getStackTrace(e), true);
+	    } finally {
+	        writer = null;
+	    }
+		
+		try {	    	
+			if(somethingWentWrong && httpConn != null) {
+    	    	log("Oops, Something went wrong, exception as follows...", true);    	    	
+    	    	log(IOUtils.toString(httpConn.getErrorStream(), Charset.forName("UTF-8")), true);
+    	    }
+	    	httpConn.disconnect();
+	    } catch (Exception e) {
+	        e.printStackTrace();
+	        log("Encountered a problem while closing the http connection, Exception: "+ExceptionUtils.getStackTrace(e), true);
+	    } finally {
+	        httpConn = null;
+	    }
+	}
+	
+	/**
+	 * Helper object to manage the body of the http connection
+	 */
+	private void transmitContent() throws Exception {
+		log("Communicating with endpoint...", false);
+    	if(header.get("Content-Type").equals("multipart/form-data")) {
+			for (Map.Entry<String,String> entry : header.entrySet()) {  
+				writer.append("--" + DEFAULT_BOUNDARY).append(LINE_FEED);
+		    	writer.append("Content-Disposition: form-data; name=\""+entry.getKey()+"\"").append(LINE_FEED);
+		    	writer.append("Content-Type: multipart/form-data; charset=" + charset).append(LINE_FEED);
+		    	writer.append(LINE_FEED);
+		    	writer.append(entry.getValue()).append(LINE_FEED);
+	    	}
+	    	writer.append("--" + DEFAULT_BOUNDARY + "--").append(LINE_FEED);	
+		} else if(header.get("Content-Type").equals("application/x-www-form-urlencoded")) {
+			String joiner = "";
+			for (Map.Entry<String,String> entry : body.entrySet()) {  
+				writer.append(joiner+entry.getKey()+"="+URLEncoder.encode(entry.getValue(), DEFAULT_CHARSET));
+				joiner = "&";
+	    	}
+		} else {
+			for (Map.Entry<String,String> entry : body.entrySet()) {
+				writer.append(entry.getValue());
+			}
+		}
+    	writer.flush();
+	}
+	
+	/**
+	 * Helper object to manage the body of the http connection
+	 * @throws Exception
+	 */
+	private void captureResponse(String response) throws Exception {
+		OutputType.valueOf(outputType).pushOutput(context, response);
+    }
+	
+	/**
+	 * Helper object to manage adding a query String
+	 */
+	private void addQueryStringToEndpoint(String key, String value) {
+		if(endpoint.contains("?")) {
+			endpoint = (endpoint+"&"+key+"="+value);
+		} else {
+			endpoint = (endpoint+"?"+key+"="+value);
+		}
+	}
+	
+	/**
+	 * Helper object to manage adding a query String
+	 */
+	private void addPathToEndpoint(String value) {
+		if(endpoint.contains("?")) {
+			endpoint = (endpoint.substring(0, endpoint.indexOf("?"))+"/"+value+endpoint.substring(endpoint.indexOf("?"), endpoint.length()));
+		} else {
+			endpoint = (endpoint+"/"+value);
+		}
+	}
+	
+	/**
+	 * Helper object to manage and simplify logging
+	 */
+	private void log(String log, boolean isError) {
+		if(loggingIsOn) {
+			if(isError) {
+				logger.error(log);
+			} else {
+				logger.info(log);
+			}
+		}
+	}
+	
+}
