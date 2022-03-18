@@ -1,0 +1,392 @@
+import static com.capeclear.assembly.annotation.Component.Type.*;
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyStore;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
+import java.text.Normalizer;
+import java.util.Base64;
+import java.util.LinkedHashMap;
+import java.util.concurrent.TimeUnit;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509TrustManager;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.exception.ExceptionUtils;
+import org.apache.http.HttpClientConnection;
+import org.apache.http.HttpEntity;
+import org.apache.http.HttpResponse;
+import org.apache.http.client.HttpClient;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.client.methods.HttpUriRequest;
+import org.apache.http.conn.scheme.Scheme;
+import org.apache.http.conn.ssl.SSLSocketFactory;
+import org.apache.http.entity.ContentType;
+import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.client.DefaultHttpClient;
+import org.apache.http.params.HttpConnectionParams;
+import org.apache.http.util.EntityUtils;
+import org.json.JSONObject;
+import com.capeclear.assembly.annotation.Component;
+import com.capeclear.assembly.annotation.ComponentMethod;
+import com.capeclear.logger.LogControl;
+import com.capeclear.logger.Logger;
+import com.capeclear.mediation.MediationContext;
+import com.ukhs.erp.workday.exception.StudioException;
+import com.ukhs.erp.workday.util.Utilities;
+
+/**************************************************************************************
+ * @Author: Dustin Harding                                                            *
+ * @Company: The University Of Kansas Health System                                   *
+ * @Created: 02/22/2022                                                               *
+ * @Purpose: Facilitate http communications with HyperSync                            *
+ * @Version:                                                                          *
+ * ************************************************************************************
+ * Date       | Author              | Note                                            *
+ * ************************************************************************************
+ * 02/22/2022 | Dustin Harding      | Initial Creation                                *
+ *                                                                                    *
+ * ************************************************************************************
+ */
+@Component(
+        name = "HyperSyncFactory",
+        type = outtransport,
+        toolTip = "HyperSyncFactory",
+        scope = "prototype",
+        smallIconPath = "icons/HttpOutFactory_16.png",
+        largeIconPath = "icons/HttpOutFactory_24.png"
+)
+@SuppressWarnings("unused")
+public class HyperSyncFactory {
+	
+	private enum HyperSyncCall {
+		SCRAMINIT("/account/scramfirst", new JSONObject()){
+			@Override
+			public HttpPost getRequest(String host, String apiKey, String message) {
+				HttpPost request = (HttpPost) getRequestObj(host, apiKey, Protocol.POST);
+				request.setEntity(new StringEntity(getJson().put("Message", message).toString(), ContentType.APPLICATION_JSON));
+				return request;
+			}
+			@Override
+			public boolean validateResponse(Object response) {
+				HttpResponse res = ((HttpResponse)response);
+				HttpEntity responseEntity = res.getEntity();
+				return responseEntity!=null&&res.getStatusLine().getStatusCode()==200&&res.getStatusLine().getReasonPhrase().equals("OK");
+			}
+		}, 
+		SCRAMAUTH("/account/scramfinal", new JSONObject()){
+			@Override
+			public HttpPost getRequest(String host, String apiKey, String message) {
+				HttpPost request = (HttpPost) getRequestObj(host, apiKey, Protocol.POST);
+				request.setEntity(new StringEntity(getJson().put("Message", message).toString(), ContentType.APPLICATION_JSON));
+				return request;
+			}
+			@SuppressWarnings("unchecked")
+			@Override
+			public boolean validateResponse(Object response) {				
+				LinkedHashMap<String,String> res = ((LinkedHashMap<String,String>)response);
+				return res.containsKey("v");
+			}
+		}, 
+		APIGET("", new JSONObject()){
+			@Override
+			public HttpGet getRequest(String host, String apiKey, String message) {
+				HttpGet request = (HttpGet) getRequestObj(host, apiKey, Protocol.GET);
+				return request;
+			}
+			@Override
+			public boolean validateResponse(Object response) {				
+				HttpResponse res = ((HttpResponse)response);
+				HttpEntity responseEntity = res.getEntity();
+				return responseEntity!=null&&res.getStatusLine().getStatusCode()==200&&res.getStatusLine().getReasonPhrase().equals("OK");
+			}
+		};		
+		private enum Protocol {GET,POST};
+		private String urlFragment;
+		private JSONObject json; 
+		
+		private HyperSyncCall(String hostFragment, JSONObject json) {
+			this.urlFragment = hostFragment;
+			this.json = json;
+		}
+		
+		public JSONObject getJson() {
+			json.put("Algorithm", "SHA512");
+			return json;
+		}
+		
+		public HttpUriRequest getRequestObj(String host, String apiKey, Protocol protocol) {
+			HttpUriRequest request = null;
+			switch(protocol) {
+				case GET: request = new HttpGet(host+urlFragment);
+					break;
+				case POST: request = new HttpPost(host+urlFragment);
+					break;
+			}
+			request.addHeader("X-Api-Key", apiKey);
+			return request;
+		}
+		public abstract boolean validateResponse(Object response);
+		public abstract HttpUriRequest getRequest(String host, String apiKey, String message);
+	}
+	public static final String HOST_CONTEXTVARKEY = "HyperSyncFactory_Host";
+	public static final String SERVER_CONTEXTVARKEY = "HyperSyncFactory_Server";
+	public static final String DOMAIN_CONTEXTVARKEY = "HyperSyncFactory_Domain";
+	public static final String USERNAME_CONTEXTVARKEY = "HyperSyncFactory_Username";
+	public static final String PASSWORD_CONTEXTVARKEY = "HyperSyncFactory_Password";
+	public static final String TENANTID_CONTEXTVARKEY = "HyperSyncFactory_TenantId";
+	public static final String APIKEY_CONTEXTVARKEY = "HyperSyncFactory_ApiKey";		
+	public static final String QUERY_CONTEXTVARKEY = "HyperSyncFactory_Query";
+	public static final String TIMEOUT_CONTEXTVARKEY = "HyperSyncFactory_Timeout";
+	public static final String RESPONSE_CONTEXTVARKEY = "HyperSyncFactory_Response";
+	private static final Logger logger = LogControl.getLogger( HyperSyncFactory.class );
+	private LinkedHashMap<String,String> responseMessageFields;
+	private String host, server, domain, username, password, tenantId, apiKey, query, salt, nonce, serverNonce, responseText, signature;
+	private int serverIteration, timeout = 30000;
+	private JSONObject json;
+	private HttpClient httpClient;
+	private HttpResponse response;
+	private MediationContext context;
+	
+	public HyperSyncFactory() {
+		
+	}
+	
+	public HyperSyncFactory(String host, String server, String domain, String username, String password, String tenantId, String apiKey, String query, int timeout) {
+		this.host = host;
+		this.server = server;
+		this.domain = domain;
+		this.username = username;
+		this.password = password;
+		this.tenantId = tenantId;
+		this.apiKey = apiKey;		
+		this.query = query;
+		this.timeout = timeout>0?(timeout<1000?(timeout*1000):timeout):this.timeout;
+	}
+	
+	@ComponentMethod
+	public void get(MediationContext context) throws Exception {
+		try {
+			this.context = context;
+			if(context != null) {
+				pullContextProperties();
+			}
+			buildClient();
+			generateNonce();
+			buildUsername();
+			if(scramAuthenticate()) {
+				HyperSyncCall call = HyperSyncCall.APIGET;
+				response = httpClient.execute(call.getRequest(host+query, apiKey, null));
+				responseText = IOUtils.toString(response.getEntity().getContent(), StandardCharsets.UTF_8);
+				json = new JSONObject(responseText);
+				if(context != null) {
+					context.setProperty(RESPONSE_CONTEXTVARKEY, json);
+				}
+			} else {
+				throw new StudioException("An unknown failure occurred while trying to authenticate!","An uknown failure occurred while trying to authenticate! The server returned a response that was unrecognizable!");
+			}			
+		} catch(Exception e) {
+			StudioException se = new StudioException("A failure occurred while trying to communicate with the HyperSync Server!", "A failure occurred while trying to communicate with the HyperSync Server! Unable to complete request!", e);
+			logger.error(ExceptionUtils.getStackTrace(se));			
+			throw se;
+		} finally {
+			destroy();
+		}
+	}
+	
+	@ComponentMethod
+	public void put(MediationContext context) throws Exception {
+		try {			
+			//TODO: code put logic here
+		} catch(Exception e) {
+			StudioException se = new StudioException("A failure occurred while trying to communicate with the HyperSync Server!", "A failure occurred while trying to communicate with the HyperSync Server! Unable to complete request!", e);
+			logger.error(ExceptionUtils.getStackTrace(se));			
+			throw se;
+		} finally {
+			destroy();
+		}
+		throw new StudioException("PUT operation is not currently supported!","PUT operation is not currently supported!", new UnsupportedOperationException());
+	}
+	
+	@ComponentMethod
+	public void post(MediationContext context) throws Exception {
+		try {
+			//TODO: code put logic here
+		} catch(Exception e) {
+			StudioException se = new StudioException("A failure occurred while trying to communicate with the HyperSync Server!", "A failure occurred while trying to communicate with the HyperSync Server! Unable to complete request!", e);
+			logger.error(ExceptionUtils.getStackTrace(se));			
+			throw se;
+		} finally {
+			destroy();
+		}
+		throw new StudioException("PUT operation is not currently supported!","PUT operation is not currently supported!", new UnsupportedOperationException());
+	}
+	
+	@ComponentMethod
+	public void delete(MediationContext context) throws Exception {
+		try {
+			//TODO: code put logic here
+		} catch(Exception e) {
+			StudioException se = new StudioException("A failure occurred while trying to communicate with the HyperSync Server!", "A failure occurred while trying to communicate with the HyperSync Server! Unable to complete request!", e);
+			logger.error(ExceptionUtils.getStackTrace(se));			
+			throw se;
+		} finally {
+			destroy();
+		}
+		throw new StudioException("PUT operation is not currently supported!","PUT operation is not currently supported!", new UnsupportedOperationException());
+	}
+
+	@ComponentMethod
+	public void response(MediationContext context) throws Exception {
+		this.context = context;
+        //do nothing 
+    }
+	
+	private boolean scramAuthenticate() throws Exception {
+		try {
+			HyperSyncCall call = HyperSyncCall.SCRAMINIT;
+			response = httpClient.execute(call.getRequest(host, apiKey, "n,,n="+username+",r="+nonce));
+			if(call.validateResponse(response)) {		
+				parseResponseMessage();
+				salt = responseMessageFields.get("s");
+				serverNonce = responseMessageFields.get("r");
+				serverIteration = Integer.parseInt(responseMessageFields.get("i"));
+				hashPassword();
+				call = HyperSyncCall.SCRAMAUTH;
+				response = httpClient.execute(call.getRequest(host, apiKey, "c=biws,r="+serverNonce+",p="+password));
+				parseResponseMessage();				
+				if(call.validateResponse(responseMessageFields)) {
+					signature = responseMessageFields.get("v");
+					return true;
+				}
+			}
+		} catch(Exception e) {
+			throw new StudioException("Failed to Authenticate to Hypersync!", "Failed to Authenticate to Hypersync! An exception was thrown while performing SCRAM authentication!", e);
+		}
+		return false;
+	}
+	
+	private void hashPassword() throws Exception {
+		ByteArrayOutputStream bStream = new ByteArrayOutputStream();
+		bStream.write(Base64.getDecoder().decode(salt));
+		bStream.write(new byte[] {1,0,0,0});
+		byte[] saltBytes = bStream.toByteArray();
+		byte[] pwdBytes = Normalizer.normalize(password, Normalizer.Form.NFKC).getBytes(StandardCharsets.UTF_8);
+		byte[] computedValue = hmac(pwdBytes, saltBytes);
+		byte[] xor = computedValue;		
+		for(int i=1;i<serverIteration;i++) {
+			computedValue = hmac(pwdBytes, computedValue);
+			xor = xor(xor, computedValue);
+		}		
+		byte[] clientKey = hmac(xor, "Client Key".getBytes(StandardCharsets.UTF_8));
+		byte[] storedKey = sha512(clientKey);
+		computedValue = hmac(storedKey, new StringBuilder().append("n=").append(username).append(",r=").append(nonce).append(",r=").append(serverNonce).append(",s=").append(salt).append(",i=").append(serverIteration).append(",c=biws,r=").append(serverNonce).toString().getBytes());
+		password = Base64.getEncoder().encodeToString(xor(clientKey, computedValue));
+	
+	}
+	
+	private void buildUsername() {
+		username = new StringBuilder().append(tenantId).append("|").append(server).append("|").append(domain).append("\\").append(username).toString();
+	}
+	
+	private void buildClient() throws Exception {
+		httpClient = new DefaultHttpClient();
+		HttpConnectionParams.setConnectionTimeout(httpClient.getParams(), timeout);
+        SSLContext sslContext = SSLContext.getInstance("TLSv1.2");
+        X509TrustManager tm = new X509TrustManager() {
+
+			@Override
+			public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {}
+
+			@Override
+			public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {}
+
+			@Override
+			public X509Certificate[] getAcceptedIssuers() {
+				return null;
+			}
+        };
+        sslContext.init(null, new TrustManager[]{tm}, null);
+        SSLSocketFactory sslSocketFactory = new SSLSocketFactory(sslContext, SSLSocketFactory.ALLOW_ALL_HOSTNAME_VERIFIER);
+        Scheme httpsScheme = new Scheme("https", 443, sslSocketFactory);
+        httpClient.getConnectionManager().getSchemeRegistry().register(httpsScheme);
+	}
+	
+	private void generateNonce() {
+		byte[] ar = new byte[512];
+		new SecureRandom().nextBytes(ar);
+        nonce = Base64.getEncoder().encodeToString(ar);
+	}
+	
+	private void parseResponseMessage() throws Exception {
+		responseText = IOUtils.toString(response.getEntity().getContent(), StandardCharsets.UTF_8);
+		responseMessageFields = new LinkedHashMap<String,String>();
+		for(String s : new JSONObject(responseText).getString("Response").split(",")){
+			responseMessageFields.put(s.substring(0,1), s.substring(2,s.length()));
+		}
+		EntityUtils.consumeQuietly(response.getEntity());
+	}
+	
+	private byte[] hmac(byte[] key, byte[] message) throws Exception {
+		Mac mac = Mac.getInstance("HmacSHA512");
+		mac.init(new SecretKeySpec(key, "HmacSHA512"));
+		return mac.doFinal(message);
+	}
+	
+	private byte[] xor(byte[] ba1, byte[] ba2) throws Exception {
+		if(ba1==null||ba2==null||ba1.length<=0||ba1.length!=ba2.length) {
+			throw new StudioException("Exception occurred while attempting to parse HyperSync response","XOR operation on byte comparison experienced a computational irregulaty!");
+		}
+		int i = 0;
+		byte[] ba3 = new byte[ba1.length];
+		for (byte b : ba1) {
+			ba3[i] = (byte) (b ^ ba2[i++]);
+		}
+		return ba3;
+	}
+	
+	private byte[] sha512(byte[] message) throws Exception {
+		return MessageDigest.getInstance("SHA-512").digest(message);		
+	}
+	
+	private void pullContextProperties() throws Exception {
+		try {
+			this.host = ((String)context.getProperty(HOST_CONTEXTVARKEY));
+			this.server = ((String)context.getProperty(SERVER_CONTEXTVARKEY));
+			this.domain = ((String)context.getProperty(DOMAIN_CONTEXTVARKEY));
+			this.username = ((String)context.getProperty(USERNAME_CONTEXTVARKEY));
+			this.password = ((String)context.getProperty(PASSWORD_CONTEXTVARKEY));
+			this.tenantId = ((String)context.getProperty(TENANTID_CONTEXTVARKEY));
+			this.apiKey = ((String)context.getProperty(APIKEY_CONTEXTVARKEY));
+			this.query = ((String)context.getProperty(QUERY_CONTEXTVARKEY));
+			if(context.getProperty(TIMEOUT_CONTEXTVARKEY)!=null) {
+				int i = ((int)context.getProperty(TIMEOUT_CONTEXTVARKEY));
+				this.timeout = i>0?(i<1000?(i*1000):i):this.timeout;
+			}
+			
+			if(!Utilities.isValidString(new String[] {host, server, domain, username, password, tenantId, apiKey, query})) {
+				throw new StudioException("Invalid State!", "Invalid State! One of the requirement input parameters for processing was not present!");
+			}
+		} catch(Exception e) {
+			throw new StudioException("Invalid State!", "Invalid State! One of the requirement input parameters for processing failed to parse!");
+		}
+	}
+	
+	private void destroy() {
+		if(response!=null&&response.getEntity()!=null) {
+			EntityUtils.consumeQuietly(response.getEntity());
+		}
+		response = null;
+		httpClient = null;
+	}
+	
+	public JSONObject getJson() {
+		return this.json;
+	}
+}
