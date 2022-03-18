@@ -1,0 +1,52 @@
+import com.capeclear.logger.LogControl;
+import com.capeclear.logger.Logger;
+import com.ukhs.erp.workday.bean.web.HttpOutFactory;
+
+import com.ukhs.erp.workday.util.Constants;
+
+public class StudioException extends Exception {
+
+	private static final long serialVersionUID = -1789467680450167581L;
+	private static final Logger logger = LogControl.getLogger( HttpOutFactory.class );
+
+	public StudioException(Throwable cause) {
+		super(cause);
+	}
+
+	public StudioException(String summary, String message, Throwable cause, boolean isFatal, boolean writableStackTrace) {
+		super(getMessage(summary,message), cause);
+		if(!isFatal && writableStackTrace) {
+			log();
+		}
+	}
+	
+	public StudioException(String summary, String message, boolean isFatal, boolean writableStackTrace) {
+		super(getMessage(summary,message));
+		if(!isFatal && writableStackTrace) {
+			log();
+		}
+	}
+	
+	public StudioException(String summary, String message, Throwable cause) {
+		super(getMessage(summary,message), cause);
+	}
+	
+	public StudioException(String summary, String message) {
+		super(getMessage(summary,message));
+	}
+	
+	private static String getMessage(String summary, String message) {
+		StringBuilder msg = new StringBuilder();
+		
+		msg.append("An error has occurred, see details below"+Constants.EXCEPTIONNEWLINE)
+		   .append("Summarization: "+summary+Constants.EXCEPTIONNEWLINE)
+		   .append("Error Details:"+Constants.EXCEPTIONNEWLINE)
+		   .append(message);
+		
+		return msg.toString();
+	}
+	
+	private void log() {
+		logger.error("", this);
+	}
+}
